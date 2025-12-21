@@ -1,8 +1,4 @@
-flask
-requests
-beautifulsoup4
-pymongo
-psycopg2-binary
 aiohttp
-asyncio
-gunicorn
+beautifulsoup4
+motor
+dnspython
