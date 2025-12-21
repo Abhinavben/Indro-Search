@@ -15,7 +15,9 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 DB_NAME = "render_data"
 COLLECTION_NAME = "web_pages_v3"
 
-CRAWL_DELAY = 1 
+# Professional User-Agent
+USER_AGENT = "IndroSearchBot/2.0 (Search Engine Research; Contact: admin@indro.in)"
+
 TARGET_SITES = [
     "https://www.isro.gov.in/", 
     "https://www.nasa.gov/news/",
@@ -26,11 +28,11 @@ TARGET_SITES = [
 ]
 
 queue = asyncio.Queue()
-seen_urls = set() # Fast RAM check to prevent freezing
-blacklist = ['about', 'contact', 'privacy', 'terms', 'help', 'signin', 'login', 'signup', 'feedback', 'legal']
+seen_urls = set()
+blacklist = ['about', 'contact', 'privacy', 'terms', 'help', 'signin', 'login', 'signup', 'feedback', 'legal', 'admin']
 
 async def handle_health(request):
-    return web.Response(text="Indro Spider is Alive and Fast! 🕷️")
+    return web.Response(text="IndroSearchBot 2.0 is Active & Ethical! 🕷️")
 
 async def backup_to_telegram(session, data):
     try:
@@ -39,7 +41,7 @@ async def backup_to_telegram(session, data):
         form = FormData()
         form.add_field('chat_id', str(TG_CHAT_ID))
         form.add_field('document', io.BytesIO(json_bytes), filename=filename)
-        async with session.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument", data=form, timeout=8) as resp:
+        async with session.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument", data=form, timeout=10) as resp:
             return resp.status == 200
     except: return False
 
@@ -48,18 +50,19 @@ async def start_crawling():
     db = client[DB_NAME]
     collection = db[COLLECTION_NAME]
     
-    for site in TARGET_SITES: await queue.put(site)
+    # Starting queue with depth 0
+    for site in TARGET_SITES: await queue.put((site, 0))
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(headers={'User-Agent': USER_AGENT}) as session:
         while True:
-            url = await queue.get()
+            url, depth = await queue.get()
             
-            # 1. Immediate RAM Check
-            if url in seen_urls:
+            # Feature: Depth Limit (Max 3 levels deep for safety)
+            if depth > 3 or url in seen_urls:
                 queue.task_done()
                 continue
             
-            # 2. Fast DB Check
+            # DB Check
             existing = await collection.find_one({"url": url}, {"_id": 1})
             if existing:
                 seen_urls.add(url)
@@ -67,45 +70,50 @@ async def start_crawling():
                 continue
 
             try:
-                # Timeout set to 5s to prevent hanging
-                async with session.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'}) as response:
-                    if response.status != 200: 
+                # Feature: Extra Delay for Government Sites (.gov)
+                current_delay = 2.5 if ".gov" in urlparse(url).netloc else 1.2
+                
+                async with session.get(url, timeout=7) as response:
+                    if response.status != 200:
                         queue.task_done()
                         continue
                     
                     html = await response.text(errors='ignore')
                     soup = BeautifulSoup(html, 'html.parser')
                     title = soup.title.string.strip() if soup.title else "No Title"
-                    text = soup.get_text(separator=' ', strip=True)[:1500]
-
-                    page_data = {"url": url, "title": title, "text": text}
                     
-                    # Parallel Save: Telegram + DB
+                    # Clean text extraction
+                    for script in soup(["script", "style"]): script.extract()
+                    text = soup.get_text(separator=' ', strip=True)[:2000]
+
+                    page_data = {"url": url, "title": title, "text": text, "depth": depth}
+                    
                     await asyncio.gather(
                         backup_to_telegram(session, page_data),
                         collection.update_one({"url": url}, {"$set": page_data}, upsert=True)
                     )
                     
                     seen_urls.add(url)
-                    print(f"🕷️ Crawling: {title[:35]}...", flush=True)
+                    print(f"🕷️ IndroSearch: {title[:35]}... (Level {depth})", flush=True)
 
-                    # Discovery: Smart filter for quality links
+                    # Link Discovery
                     links_found = 0
                     for a in soup.find_all('a', href=True):
-                        if links_found >= 10: break 
+                        if links_found >= 12: break 
                         link = urljoin(url, a['href'])
+                        
+                        # Internal links only & Blacklist check
                         if urlparse(link).netloc == urlparse(url).netloc:
                             if not any(word in link.lower() for word in blacklist):
-                                await queue.put(link)
+                                await queue.put((link, depth + 1))
                                 links_found += 1
 
             except Exception: pass
             
-            # Prevent memory leak by clearing set occasionally
-            if len(seen_urls) > 10000: seen_urls.clear()
+            if len(seen_urls) > 8000: seen_urls.clear()
             
             queue.task_done()
-            await asyncio.sleep(CRAWL_DELAY)
+            await asyncio.sleep(current_delay)
 
 async def main():
     app = web.Application()
@@ -114,7 +122,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
-    print("🚀 Spider Bot Restarted. Fixing Freeze! 🕷️", flush=True)
+    print("🚀 IndroSearchBot 2.0 Started. Purely Ethical & Secure. 🕷️", flush=True)
     asyncio.create_task(start_crawling())
     while True: await asyncio.sleep(3600)
 
