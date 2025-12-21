@@ -26,10 +26,11 @@ TARGET_SITES = [
 ]
 
 queue = asyncio.Queue()
+seen_urls = set() # Fast RAM check to prevent freezing
 blacklist = ['about', 'contact', 'privacy', 'terms', 'help', 'signin', 'login', 'signup', 'feedback', 'legal']
 
 async def handle_health(request):
-    return web.Response(text="Indro Spider Engine is Active! 🕷️")
+    return web.Response(text="Indro Spider is Alive and Fast! 🕷️")
 
 async def backup_to_telegram(session, data):
     try:
@@ -38,7 +39,7 @@ async def backup_to_telegram(session, data):
         form = FormData()
         form.add_field('chat_id', str(TG_CHAT_ID))
         form.add_field('document', io.BytesIO(json_bytes), filename=filename)
-        async with session.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument", data=form) as resp:
+        async with session.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument", data=form, timeout=8) as resp:
             return resp.status == 200
     except: return False
 
@@ -53,14 +54,21 @@ async def start_crawling():
         while True:
             url = await queue.get()
             
+            # 1. Immediate RAM Check
+            if url in seen_urls:
+                queue.task_done()
+                continue
+            
+            # 2. Fast DB Check
             existing = await collection.find_one({"url": url}, {"_id": 1})
             if existing:
+                seen_urls.add(url)
                 queue.task_done()
                 continue
 
             try:
-                headers = {'User-Agent': 'Mozilla/5.0'}
-                async with session.get(url, timeout=10, headers=headers) as response:
+                # Timeout set to 5s to prevent hanging
+                async with session.get(url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'}) as response:
                     if response.status != 200: 
                         queue.task_done()
                         continue
@@ -68,21 +76,23 @@ async def start_crawling():
                     html = await response.text(errors='ignore')
                     soup = BeautifulSoup(html, 'html.parser')
                     title = soup.title.string.strip() if soup.title else "No Title"
-                    text = soup.get_text(separator=' ', strip=True)[:2500]
+                    text = soup.get_text(separator=' ', strip=True)[:1500]
 
                     page_data = {"url": url, "title": title, "text": text}
                     
+                    # Parallel Save: Telegram + DB
                     await asyncio.gather(
                         backup_to_telegram(session, page_data),
                         collection.update_one({"url": url}, {"$set": page_data}, upsert=True)
                     )
                     
-                    # Wahi purana style wapas!
+                    seen_urls.add(url)
                     print(f"🕷️ Crawling: {title[:35]}...", flush=True)
 
+                    # Discovery: Smart filter for quality links
                     links_found = 0
                     for a in soup.find_all('a', href=True):
-                        if links_found >= 15: break 
+                        if links_found >= 10: break 
                         link = urljoin(url, a['href'])
                         if urlparse(link).netloc == urlparse(url).netloc:
                             if not any(word in link.lower() for word in blacklist):
@@ -90,6 +100,9 @@ async def start_crawling():
                                 links_found += 1
 
             except Exception: pass
+            
+            # Prevent memory leak by clearing set occasionally
+            if len(seen_urls) > 10000: seen_urls.clear()
             
             queue.task_done()
             await asyncio.sleep(CRAWL_DELAY)
@@ -101,7 +114,7 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 10000)))
     await site.start()
-    print("🚀 Spider Bot Started. Web chhanna shuru! 🕷️", flush=True)
+    print("🚀 Spider Bot Restarted. Fixing Freeze! 🕷️", flush=True)
     asyncio.create_task(start_crawling())
     while True: await asyncio.sleep(3600)
 
