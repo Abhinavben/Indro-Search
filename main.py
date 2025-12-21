@@ -8,27 +8,28 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 
-# --- 1. CONFIGURATION (Render Environment Group se aayega) ---
+# --- 1. CONFIGURATION (Fetched from Render Environment Groups) ---
 MONGO_URI = os.getenv("MONGO_URI")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 
-# Safety Settings
+# Advanced Settings
 DB_NAME = "render_data"
 COLLECTION_NAME = "web_pages_v2"
-MAX_QUEUE_SIZE = 100 # RAM safe limit
-CRAWL_DELAY = 3      # 3 seconds ka safe gap (Sarkari site block nahi karegi)
+MAX_QUEUE_SIZE = 100 # RAM safety
+CRAWL_DELAY = 3      # Safe gap (High Level Safety)
 START_URL = "https://www.isro.gov.in/"
 
 seen_urls = set()
 queue = asyncio.Queue()
 
-# --- 2. TELEGRAM BACKUP ---
+# --- 2. TELEGRAM BACKUP (Cloud Storage) ---
 async def backup_to_telegram(session, url, data):
     try:
+        # JSON formatting
         json_bytes = json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
         file_obj = io.BytesIO(json_bytes)
-        file_obj.name = f"indro_safe_{str(asyncio.get_event_loop().time()).replace('.', '')}.json"
+        file_obj.name = f"indro_data_{str(asyncio.get_event_loop().time()).replace('.', '')}.json"
 
         form = FormData()
         form.add_field('chat_id', TG_CHAT_ID)
@@ -38,67 +39,88 @@ async def backup_to_telegram(session, url, data):
         tg_url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument"
         async with session.post(tg_url, data=form) as resp:
             return resp.status == 200
-    except:
+    except Exception as e:
+        print(f"⚠️ TG Error: {e}")
         return False
 
-# --- 3. CRAWLER LOGIC ---
+# --- 3. THE ENGINE (With Encoding & Error Fixes) ---
 async def process_url(session, db, url):
     if url in seen_urls: return
+    
     try:
-        # User-Agent add kiya hai taaki hum "Real Browser" lagein
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        # Browser impersonation (High Level Safety)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
         
-        async with session.get(url, timeout=15, headers=headers) as response:
+        async with session.get(url, timeout=20, headers=headers) as response:
             if response.status != 200: return
             
-            soup = BeautifulSoup(await response.text(), 'html.parser')
-            title = soup.title.string if soup.title else "No Title"
+            # Binary read with forced decoding (Encoding Fix)
+            raw_content = await response.read()
+            html_text = raw_content.decode('utf-8', errors='ignore')
             
-            # Heavy content for Telegram
-            full_info = {
+            soup = BeautifulSoup(html_text, 'html.parser')
+            title = soup.title.string.strip() if soup.title else "No Title"
+            
+            # Content Extraction
+            page_content = {
                 "url": url,
                 "title": title,
-                "text": soup.get_text(separator=' ', strip=True)[:8000]
+                "text": soup.get_text(separator=' ', strip=True)[:8000], # Safe length
+                "domain": urlparse(url).netloc
             }
-            await backup_to_telegram(session, url, full_info)
 
-            # Mongo save (Lightweight)
+            # 1. Telegram Backup
+            await backup_to_telegram(session, url, page_content)
+
+            # 2. Mongo Lite Save
             await db[COLLECTION_NAME].update_one(
                 {"url": url}, 
-                {"$set": {"url": url, "title": title, "safe_indexed": True}}, 
+                {"$set": {"url": url, "title": title, "status": "safe_indexed"}}, 
                 upsert=True
             )
+            
             seen_urls.add(url)
-            print(f"🛡️ Safe Indexed: {title[:30]}...")
+            print(f"✅ Safe Indexed: {title[:40]}")
 
-            # Links collection (No Jumping - Same Domain Only)
+            # 3. Smart Link Discovery (Same Domain)
             if queue.qsize() < MAX_QUEUE_SIZE:
-                for a in soup.find_all('a', href=True):
-                    next_url = urljoin(url, a['href'])
-                    if urlparse(next_url).netloc == urlparse(url).netloc:
-                        if next_url not in seen_urls: await queue.put(next_url)
-    except Exception as e:
-        print(f"⚠️ Skipping {url} due to error.")
+                for link in soup.find_all('a', href=True):
+                    full_link = urljoin(url, link['href'])
+                    if urlparse(full_link).netloc == urlparse(url).netloc:
+                        if full_link not in seen_urls:
+                            await queue.put(full_link)
 
-# --- 4. ENGINE START ---
+    except Exception as e:
+        print(f"⚠️ Skipping {url} | Error: {e}")
+
+# --- 4. MAIN RUNNER (Persistence Logic) ---
 async def main():
-    if not MONGO_URI or not TG_BOT_TOKEN:
-        print("❌ CRITICAL ERROR: Environment variables missing!")
+    if not all([MONGO_URI, TG_BOT_TOKEN, TG_CHAT_ID]):
+        print("❌ CRITICAL: Missing Env Variables! Check Render Settings.")
         return
 
     client = AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
     
-    print("🧠 Loading Memory...")
+    # Reload history
+    print("🧠 Memory Loading...")
     async for doc in db[COLLECTION_NAME].find({}, {"url": 1}):
         seen_urls.add(doc['url'])
-    
+    print(f"✅ {len(seen_urls)} links restored from DB.")
+
     async with aiohttp.ClientSession() as session:
-        await queue.put(START_URL)
+        # Start from where we left or START_URL
+        if not seen_urls:
+            await queue.put(START_URL)
+        else:
+            await queue.put(list(seen_urls)[-1])
+
         while not queue.empty():
-            current_target = await queue.get()
-            await process_url(session, db, current_target)
-            # Yahan hai asli safety gap
+            current_url = await queue.get()
+            await process_url(session, db, current_url)
+            # High-level safety delay
             await asyncio.sleep(CRAWL_DELAY)
 
 if __name__ == "__main__":
