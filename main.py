@@ -8,59 +8,56 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 
-# --- 1. CONFIG ---
+# --- CONFIGURATION ---
 MONGO_URI = os.getenv("MONGO_URI")
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-
 DB_NAME = "render_data"
 COLLECTION_NAME = "web_pages_v2"
-MAX_QUEUE_SIZE = 50  # Memory safe
-CRAWL_DELAY = 5      # Balanced speed
+MAX_QUEUE_SIZE = 100 
+CRAWL_DELAY = 2      # Fast speed, back to action!
 START_URL = "https://www.isro.gov.in/"
 
 seen_urls = set()
 queue = asyncio.Queue()
 
-# --- 2. RENDER HEALTH CHECK (The Proper Way) ---
-async def handle_health(request):
-    return web.Response(text="Indro is Alive")
+# --- 1. RENDER HEALTH CHECK SERVER ---
+async def handle_home(request):
+    return web.Response(text="Indro Search Engine is Live and Crawling!")
 
-# --- 3. TELEGRAM BACKUP ---
+# --- 2. TELEGRAM BACKUP ---
 async def backup_to_telegram(session, url, data):
     try:
         json_str = json.dumps(data, indent=2, ensure_ascii=False)
         file_obj = io.BytesIO(json_str.encode('utf-8', errors='ignore'))
         file_obj.name = "indro_data.json"
-        
         form = FormData()
-        form.add_field('chat_id', str(TG_CHAT_ID)) # Ensure string
+        form.add_field('chat_id', str(TG_CHAT_ID))
         form.add_field('document', file_obj)
-        
         async with session.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument", data=form) as resp:
             return resp.status == 200
-    except Exception as e:
-        print(f"❌ TG Send Error: {e}")
-        return False
+    except: return False
 
-# --- 4. CRAWLER LOGIC ---
+# --- 3. CRAWLER PROCESS ---
 async def process_url(session, db, url):
     if url in seen_urls: return
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        async with session.get(url, timeout=15, headers=headers) as response:
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        async with session.get(url, timeout=20, headers=headers) as response:
             if response.status != 200: return
-            html = await response.text(errors='ignore')
+            raw = await response.read()
+            html = raw.decode('utf-8', errors='ignore')
             soup = BeautifulSoup(html, 'html.parser')
             title = soup.title.string.strip() if soup.title else "No Title"
             
-            # Action
+            # Action: Save to Cloud
             await backup_to_telegram(session, url, {"url": url, "title": title, "text": soup.get_text()[:4000]})
             await db[COLLECTION_NAME].update_one({"url": url}, {"$set": {"url": url, "title": title}}, upsert=True)
             
             seen_urls.add(url)
             print(f"✅ Indexed: {title[:30]}")
 
+            # Link Discovery
             if queue.qsize() < MAX_QUEUE_SIZE:
                 for a in soup.find_all('a', href=True):
                     link = urljoin(url, a['href'])
@@ -69,38 +66,47 @@ async def process_url(session, db, url):
     except Exception as e:
         print(f"⚠️ Skip {url}: {e}")
 
-# --- 5. MAIN ENGINE ---
-async def run_crawler():
+# --- 4. ENGINE RUNNER ---
+async def start_crawling():
     client = AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
     
-    # Reload history
+    # Reload from DB
     async for doc in db[COLLECTION_NAME].find({}, {"url": 1}):
         seen_urls.add(doc['url'])
-    print(f"🧠 Memory Loaded: {len(seen_urls)}")
+    print(f"🧠 Memory Loaded: {len(seen_urls)} links.")
 
     async with aiohttp.ClientSession() as session:
-        if not seen_urls: await queue.put(START_URL)
-        else: await queue.put(list(seen_urls)[-1]) # Resume from last
-
+        await queue.put(START_URL)
         while True:
             url = await queue.get()
             await process_url(session, db, url)
             await asyncio.sleep(CRAWL_DELAY)
 
-async def start_all():
-    # Health check server start
+# --- 5. MAIN (Parallel Processing) ---
+async def main():
+    # Setup Web App
     app = web.Application()
-    app.router.add_get('/', handle_health)
+    app.router.add_get('/', handle_home)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv("PORT", 10000)))
     
-    print("🚀 Starting Web Server & Crawler...")
-    await asyncio.gather(
-        site.start(),
-        run_crawler()
-    )
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    
+    print(f"🚀 Server starting on port {port}")
+    await site.start()
+    
+    # Run Crawler in the background as a Task
+    # Yahi wo magic line hai jo crash rokkegi
+    asyncio.create_task(start_crawling())
+    
+    # Infinite loop to keep the main process alive
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    asyncio.run(start_all())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
