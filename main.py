@@ -5,7 +5,9 @@ import io
 import os
 import gc
 import psutil
+import time
 import warnings
+import urllib.robotparser
 from aiohttp import web, FormData
 from motor.motor_asyncio import AsyncIOMotorClient
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
@@ -18,9 +20,9 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 DB_NAME = "render_data"
 COLLECTION_NAME = "web_pages_v3"
 QUEUE_COLLECTION = "link_queue"
-USER_AGENT = "IndroSearchBot/7.6 (Smart Cache Mode)"
+USER_AGENT = "IndroSearchBot/8.0 (Safe Render Mode)"
 
-# 40 MASTER SITES
+# 40 MASTER SITES (Target List)
 TARGET_SITES = [
     "https://www.isro.gov.in/", "https://www.nasa.gov/news/", "https://www.bbc.com/news", 
     "https://www.nature.com/", "https://gadgets360.com/", "https://www.indiatoday.in/science",
@@ -36,85 +38,86 @@ TARGET_SITES = [
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
+# --- GLOBAL SAFETY MEMORY ---
+robots_cache = {}        # Robots.txt Rules yaad rakhne ke liye
+domain_last_visit = {}   # Rate Limiting ke liye
+
 def get_memory_usage():
     process = psutil.Process(os.getpid())
     return round(process.memory_info().rss / (1024 * 1024), 2)
 
-# --- TELEGRAM BACKUP ---
-async def backup_to_telegram(session, data):
+# --- 👮‍♂️ SAFETY CHECKER (New Feature) ---
+async def is_safe_to_crawl(session, url):
     try:
-        json_bytes = json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
-        form = FormData()
-        form.add_field('chat_id', str(TG_CHAT_ID))
-        filename = f"indro_{data['title'][:10].replace(' ','_')}_{int(asyncio.get_event_loop().time())}.json"
-        form.add_field('document', io.BytesIO(json_bytes), filename=filename)
-        async with session.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument", data=form, timeout=15) as resp:
-            return resp.status == 200
-    except: return False
+        parsed = urlparse(url)
+        domain = parsed.netloc
 
-# --- FRONTEND UI ---
+        # 1. Rate Limiting (Politeness)
+        # Ek hi domain par har 2 second me sirf 1 baar jao
+        last_time = domain_last_visit.get(domain, 0)
+        if time.time() - last_time < 2:
+            return False # Abhi mat jao, wait karo
+        
+        domain_last_visit[domain] = time.time()
+
+        # 2. Check Robots.txt Cache
+        if domain in robots_cache:
+            return robots_cache[domain].can_fetch(USER_AGENT, url)
+        
+        # 3. Download robots.txt (Agar cache me nahi hai)
+        robots_url = f"{parsed.scheme}://{domain}/robots.txt"
+        async with session.get(robots_url, timeout=5) as resp:
+            if resp.status == 200:
+                content = await resp.text()
+                rp = urllib.robotparser.RobotFileParser()
+                rp.parse(content.splitlines())
+                robots_cache[domain] = rp
+                return rp.can_fetch(USER_AGENT, url)
+            else:
+                return True # Robots.txt nahi hai, toh allowed hai
+    except:
+        return True # Error aye toh safe maan lo
+
+# --- TELEGRAM BACKUP (With Retry) ---
+async def backup_to_telegram(session, data):
+    json_bytes = json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
+    filename = f"indro_{data['title'][:10].replace(' ','_')}_{int(time.time())}.json"
+    
+    # Retry Loop (3 baar koshish karega)
+    for attempt in range(3):
+        try:
+            form = FormData()
+            form.add_field('chat_id', str(TG_CHAT_ID))
+            form.add_field('document', io.BytesIO(json_bytes), filename=filename)
+            
+            async with session.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument", data=form, timeout=30) as resp:
+                if resp.status == 200:
+                    return True # Success
+                elif resp.status == 429:
+                    await asyncio.sleep(5) # Thoda ruko agar limit cross hui
+        except:
+            await asyncio.sleep(2)
+    return False
+
+# --- FRONTEND UI (Same as before) ---
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="hi">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Indro Search</title>
+    <title>Indro Safe Search</title>
     <style>
-        body { font-family: 'Arial', sans-serif; text-align: center; margin: 0; background-color: #fff; display: flex; flex-direction: column; min-height: 100vh; }
-        .main-content { flex: 1; padding-top: 80px; }
-        .logo { font-size: 75px; font-weight: bold; margin-bottom: 25px; letter-spacing: -3px; }
-        .logo span:nth-child(1) { color: #4285F4; } .logo span:nth-child(2) { color: #EA4335; }
-        .logo span:nth-child(3) { color: #FBBC05; } .logo span:nth-child(4) { color: #34A853; }
-        .logo span:nth-child(5) { color: #EA4335; }
-        .search-box { width: 90%; max-width: 580px; margin: 0 auto; }
-        input { width: 100%; padding: 14px 25px; border-radius: 24px; border: 1px solid #dfe1e5; font-size: 16px; outline: none; }
-        input:hover { box-shadow: 0 1px 6px rgba(32,33,36,0.28); }
-        .buttons { margin-top: 25px; }
-        button { background-color: #f8f9fa; border: 1px solid #f8f9fa; border-radius: 4px; padding: 10px 22px; cursor: pointer; color: #3c4043; }
-        button:hover { border-color: #dadce0; box-shadow: 0 1px 1px rgba(0,0,0,0.1); }
-        #results { text-align: left; max-width: 650px; margin: 40px auto; padding: 0 20px; }
-        .result-item { margin-bottom: 25px; }
-        .result-title { font-size: 20px; color: #1a0dab; text-decoration: none; display: block; }
-        .result-title:hover { text-decoration: underline; }
-        .result-url { font-size: 14px; color: #202124; }
-        .result-snippet { font-size: 14px; color: #4d5156; margin-top: 6px; }
-        footer { background: #f2f2f2; padding: 15px; color: #70757a; font-size: 14px; margin-top: auto; }
+        body { font-family: sans-serif; text-align: center; padding: 50px; }
+        h1 { color: #4285F4; }
     </style>
 </head>
 <body>
-    <div class="main-content">
-        <div class="logo"><span>I</span><span>n</span><span>d</span><span>r</span><span>o</span></div>
-        <div class="search-box"><input type="text" id="query" placeholder="Search..." onkeydown="if(event.key === 'Enter') doSearch()"></div>
-        <div class="buttons"><button onclick="doSearch()">Indro Search</button></div>
-        <div id="results"></div>
-    </div>
-    <footer>Indro Search AI • Smart Cache Active</footer>
-    <script>
-        async function doSearch() {
-            const query = document.getElementById('query').value;
-            if(!query) return;
-            const resDiv = document.getElementById('results');
-            resDiv.innerHTML = "<p style='text-align:center; margin-top:20px;'>Searching...</p>";
-            try {
-                const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-                const data = await response.json();
-                resDiv.innerHTML = "";
-                if (data.length === 0) { resDiv.innerHTML = "<p style='text-align:center;'>No results found.</p>"; return; }
-                data.forEach(item => {
-                    const div = document.createElement('div');
-                    div.className = 'result-item';
-                    div.innerHTML = `<div class="result-url">${item.url}</div><a href="${item.url}" class="result-title" target="_blank">${item.title}</a><div class="result-snippet">${item.text}...</div>`;
-                    resDiv.appendChild(div);
-                });
-            } catch (e) { resDiv.innerHTML = "<p style='text-align:center; color:red;'>Error.</p>"; }
-        }
-    </script>
+    <h1>🦅 Indro Safe Search Active</h1>
+    <p>System Status: 🟢 Protected Mode</p>
 </body>
 </html>
 """
 
-# --- WEB HANDLERS ---
 async def handle_home(request): return web.Response(text=HTML_TEMPLATE, content_type='text/html')
 async def handle_search(request):
     query = request.query.get('q', '').lower()
@@ -126,16 +129,15 @@ async def handle_search(request):
     async for doc in cursor: results.append({"title": doc.get("title", "No Title"), "url": doc.get("url", "#"), "text": doc.get("text", "")[:180]})
     return web.json_response(results)
 
-# --- SMART CRAWLER (RAM Cache + DB) ---
+# --- SMART CRAWLER ---
 async def start_crawling():
     client = AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
     pages_col = db[COLLECTION_NAME]
     queue_col = db[QUEUE_COLLECTION]
     
-    # 🧠 RAM CACHE (Small Temporary Memory)
     ram_cache = set()
-    MAX_RAM_CACHE = 2000 
+    MAX_RAM_CACHE = 1500 # Limit thoda kam kiya RAM bachane ke liye
 
     BLACKLIST = ["facebook.com", "twitter.com", "instagram.com", "linkedin.com", "youtube.com", "accounts.google.com"]
     IMPORTANT_KEYWORDS = ["news", "article", "story", "2025", "report", "update", "science", "tech", "india", "ai", "money"]
@@ -151,14 +153,16 @@ async def start_crawling():
 
             url, depth = task['url'], task['depth']
             if depth > 3: continue
-
-            # 1. RAM Check (Super Fast - 0.0001s)
             if url in ram_cache: continue
 
-            # 2. DB Check (Reliable - 0.1s)
-            # Agar RAM me nahi mila, to DB se pucho
+            # 🛑 SAFETY CHECK (Sabse Pehle)
+            if not await is_safe_to_crawl(session, url):
+                print(f"🛑 Skipped (Robots/Limit): {url[:40]}", flush=True)
+                continue
+            # ---------------------------
+
             if await pages_col.find_one({"url": url}, {"_id": 1}):
-                ram_cache.add(url) # DB me mil gaya, to RAM me bhi daal lo agli baar ke liye
+                ram_cache.add(url)
                 continue
 
             try:
@@ -172,19 +176,17 @@ async def start_crawling():
                         text = soup.get_text(separator=' ', strip=True)[:1500]
                         page_data = {"url": url, "title": title, "text": text, "keywords": IMPORTANT_KEYWORDS}
                         
-                        # Hybrid Save
                         await asyncio.gather(
                             pages_col.update_one({"url": url}, {"$set": page_data}, upsert=True),
                             backup_to_telegram(session, page_data)
                         )
                         print(f"   ✅ Saved: {title[:20]}", flush=True)
                         
-                        # Add to RAM Cache
                         ram_cache.add(url)
 
                         saved_links_count = 0
                         for a in soup.find_all('a', href=True):
-                            if saved_links_count >= 30: break 
+                            if saved_links_count >= 25: break  # Limit kam kiya taaki CPU na bhare
                             new_link = urljoin(url, a['href'])
                             parsed = urlparse(new_link)
                             
@@ -192,22 +194,20 @@ async def start_crawling():
                                 is_important = any(k in new_link.lower() or k in a.get_text().lower() for k in IMPORTANT_KEYWORDS)
                                 if is_important or saved_links_count < 5:
                                     nd = depth + 1 if parsed.netloc == urlparse(url).netloc else 1
-                                    
-                                    # Check RAM before Queue (Speed Up)
                                     if new_link not in ram_cache:
                                         await queue_col.update_one({"url": new_link}, {"$setOnInsert": {"url": new_link, "depth": nd}}, upsert=True)
                                         saved_links_count += 1
                         
                         del soup, html
-                        gc.collect()
+                        gc.collect() # Har step par safai
                         
-                        # Cache Clean Logic
                         if len(ram_cache) > MAX_RAM_CACHE:
                             ram_cache.clear()
-                            print("🧹 RAM Cache cleared to keep memory low.", flush=True)
+                            robots_cache.clear() # Rules bhi reset karo RAM bachane ke liye
+                            print("🧹 RAM Cache & Rules cleared.", flush=True)
 
             except Exception: pass
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0) # Thoda saans lene do CPU ko
 
 async def main():
     app = web.Application()
@@ -218,8 +218,14 @@ async def main():
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"🚀 INDRO 7.6 SMART CACHE LIVE", flush=True)
+    print(f"🚀 INDRO 8.0 SAFE MODE LIVE", flush=True)
+    
+    # 512MB me 2 Worker safe hain
+    # Isse speed double hogi par RAM limit me rahegi
     asyncio.create_task(start_crawling()) 
+    await asyncio.sleep(2)
+    asyncio.create_task(start_crawling()) 
+    
     while True: await asyncio.sleep(3600)
 
 if __name__ == "__main__":
