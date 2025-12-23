@@ -18,7 +18,7 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID")
 DB_NAME = "render_data"
 COLLECTION_NAME = "web_pages_v3"
 QUEUE_COLLECTION = "link_queue"
-USER_AGENT = "IndroSearchBot/7.2 (Unlimited Hybrid Mode)"
+USER_AGENT = "IndroSearchBot/7.6 (Smart Cache Mode)"
 
 # 40 MASTER SITES
 TARGET_SITES = [
@@ -40,22 +40,17 @@ def get_memory_usage():
     process = psutil.Process(os.getpid())
     return round(process.memory_info().rss / (1024 * 1024), 2)
 
-# --- TELEGRAM BACKUP (UNLIMITED STORAGE) ---
+# --- TELEGRAM BACKUP ---
 async def backup_to_telegram(session, data):
     try:
-        # JSON file memory me banao
         json_bytes = json.dumps(data, indent=2, ensure_ascii=False).encode('utf-8')
         form = FormData()
         form.add_field('chat_id', str(TG_CHAT_ID))
-        # Unique Name with Time
-        filename = f"indro_{int(asyncio.get_event_loop().time())}.json"
+        filename = f"indro_{data['title'][:10].replace(' ','_')}_{int(asyncio.get_event_loop().time())}.json"
         form.add_field('document', io.BytesIO(json_bytes), filename=filename)
-        
-        # Telegram API call
         async with session.post(f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendDocument", data=form, timeout=15) as resp:
             return resp.status == 200
-    except: 
-        return False
+    except: return False
 
 # --- FRONTEND UI ---
 HTML_TEMPLATE = """
@@ -78,8 +73,8 @@ HTML_TEMPLATE = """
         .buttons { margin-top: 25px; }
         button { background-color: #f8f9fa; border: 1px solid #f8f9fa; border-radius: 4px; padding: 10px 22px; cursor: pointer; color: #3c4043; }
         button:hover { border-color: #dadce0; box-shadow: 0 1px 1px rgba(0,0,0,0.1); }
-        #results { text-align: left; max-width: 650px; margin: 40px auto 20px; padding: 0 20px; }
-        .result-item { margin-bottom: 28px; }
+        #results { text-align: left; max-width: 650px; margin: 40px auto; padding: 0 20px; }
+        .result-item { margin-bottom: 25px; }
         .result-title { font-size: 20px; color: #1a0dab; text-decoration: none; display: block; }
         .result-title:hover { text-decoration: underline; }
         .result-url { font-size: 14px; color: #202124; }
@@ -94,7 +89,7 @@ HTML_TEMPLATE = """
         <div class="buttons"><button onclick="doSearch()">Indro Search</button></div>
         <div id="results"></div>
     </div>
-    <footer>Indro Search AI • Unlimited Telegram Cloud Active</footer>
+    <footer>Indro Search AI • Smart Cache Active</footer>
     <script>
         async function doSearch() {
             const query = document.getElementById('query').value;
@@ -131,30 +126,40 @@ async def handle_search(request):
     async for doc in cursor: results.append({"title": doc.get("title", "No Title"), "url": doc.get("url", "#"), "text": doc.get("text", "")[:180]})
     return web.json_response(results)
 
-# --- CRAWLER LOGIC (Hybrid Mode) ---
+# --- SMART CRAWLER (RAM Cache + DB) ---
 async def start_crawling():
     client = AsyncIOMotorClient(MONGO_URI)
     db = client[DB_NAME]
     pages_col = db[COLLECTION_NAME]
     queue_col = db[QUEUE_COLLECTION]
     
+    # 🧠 RAM CACHE (Small Temporary Memory)
+    ram_cache = set()
+    MAX_RAM_CACHE = 2000 
+
     BLACKLIST = ["facebook.com", "twitter.com", "instagram.com", "linkedin.com", "youtube.com", "accounts.google.com"]
     IMPORTANT_KEYWORDS = ["news", "article", "story", "2025", "report", "update", "science", "tech", "india", "ai", "money"]
 
     async with aiohttp.ClientSession(headers={'User-Agent': USER_AGENT}) as session:
         while True:
             task = await queue_col.find_one_and_delete({})
-            
-            # Queue khali hone par refill
             if not task:
                 print("📭 Queue Empty! Refilling...", flush=True)
-                for site in TARGET_SITES: 
-                    await queue_col.update_one({"url": site}, {"$setOnInsert": {"url": site, "depth": 0}}, upsert=True)
+                for site in TARGET_SITES: await queue_col.update_one({"url": site}, {"$setOnInsert": {"url": site, "depth": 0}}, upsert=True)
                 await asyncio.sleep(30)
                 continue
 
             url, depth = task['url'], task['depth']
             if depth > 3: continue
+
+            # 1. RAM Check (Super Fast - 0.0001s)
+            if url in ram_cache: continue
+
+            # 2. DB Check (Reliable - 0.1s)
+            # Agar RAM me nahi mila, to DB se pucho
+            if await pages_col.find_one({"url": url}, {"_id": 1}):
+                ram_cache.add(url) # DB me mil gaya, to RAM me bhi daal lo agli baar ke liye
+                continue
 
             try:
                 print(f"🔍 [SCAN] RAM:{get_memory_usage()}MB | {url[:40]}...", flush=True)
@@ -164,21 +169,19 @@ async def start_crawling():
                         soup = BeautifulSoup(html, 'html.parser')
                         title = soup.title.string.strip() if soup.title else "No Title"
                         
-                        # --- CHANGE: Always update Mongo AND Send to Telegram ---
-                        # Hum check hata rahe hain ki "if not in mongo".
-                        # Taki wo purane links ko bhi dobara scan karke Telegram bheje.
-                        
                         text = soup.get_text(separator=' ', strip=True)[:1500]
                         page_data = {"url": url, "title": title, "text": text, "keywords": IMPORTANT_KEYWORDS}
                         
-                        # Gather ensures both happen
+                        # Hybrid Save
                         await asyncio.gather(
                             pages_col.update_one({"url": url}, {"$set": page_data}, upsert=True),
                             backup_to_telegram(session, page_data)
                         )
-                        print(f"   [HYBRID] ✅ Updated Mongo + Sent to TG: {title[:15]}", flush=True)
+                        print(f"   ✅ Saved: {title[:20]}", flush=True)
+                        
+                        # Add to RAM Cache
+                        ram_cache.add(url)
 
-                        # Links logic
                         saved_links_count = 0
                         for a in soup.find_all('a', href=True):
                             if saved_links_count >= 30: break 
@@ -188,12 +191,21 @@ async def start_crawling():
                             if new_link.startswith('http') and not any(b in parsed.netloc for b in BLACKLIST):
                                 is_important = any(k in new_link.lower() or k in a.get_text().lower() for k in IMPORTANT_KEYWORDS)
                                 if is_important or saved_links_count < 5:
-                                    new_depth = depth + 1 if parsed.netloc == urlparse(url).netloc else 1
-                                    await queue_col.update_one({"url": new_link}, {"$setOnInsert": {"url": new_link, "depth": new_depth}}, upsert=True)
-                                    saved_links_count += 1
+                                    nd = depth + 1 if parsed.netloc == urlparse(url).netloc else 1
+                                    
+                                    # Check RAM before Queue (Speed Up)
+                                    if new_link not in ram_cache:
+                                        await queue_col.update_one({"url": new_link}, {"$setOnInsert": {"url": new_link, "depth": nd}}, upsert=True)
+                                        saved_links_count += 1
                         
                         del soup, html
                         gc.collect()
+                        
+                        # Cache Clean Logic
+                        if len(ram_cache) > MAX_RAM_CACHE:
+                            ram_cache.clear()
+                            print("🧹 RAM Cache cleared to keep memory low.", flush=True)
+
             except Exception: pass
             await asyncio.sleep(1.5)
 
@@ -206,7 +218,7 @@ async def main():
     port = int(os.environ.get("PORT", 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    print(f"🚀 INDRO 7.2 HYBRID LIVE (Unlimited Telegram + Search)", flush=True)
+    print(f"🚀 INDRO 7.6 SMART CACHE LIVE", flush=True)
     asyncio.create_task(start_crawling()) 
     while True: await asyncio.sleep(3600)
 
